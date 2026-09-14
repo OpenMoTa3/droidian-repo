@@ -2,11 +2,6 @@ name: Update APT Repository
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_run_id:
-        description: "Kernel Actions Run ID (Optional, leave empty for latest)"
-        required: false
-        default: ""
   push:
     branches:
       - main
@@ -41,54 +36,61 @@ jobs:
           mkdir -p site/pool/main
           mkdir -p site/dists/bookworm/main/binary-arm64
 
-      - name: Download Kernel Debs
+      - name: Fetch Kernel Debs from Kernel Repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd site/pool/main
-          echo "=== 正在获取内核构建产物 ==="
-          RUN_ID="${{ github.event.inputs.kernel_run_id }}"
-          if [ -z "$RUN_ID" ]; then
-            RUN_ID=$(gh run list --repo OpenMoTa3/kernel-fairphone-sm7225 --workflow "build-droidian-kernel.yml" --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
-          fi
-          if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-            echo ">>> 找到内核构建 Run ID: $RUN_ID，正在下载产物..."
-            gh run download "$RUN_ID" --repo OpenMoTa3/kernel-fairphone-sm7225 --dir . || true
+          echo "=== 1. 正在拉取内核 Deb 包 ==="
+          KERNEL_RUN_ID=$(gh run list --repo OpenMoTa3/kernel-fairphone-sm7225 --workflow "build-droidian-kernel.yml" --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$KERNEL_RUN_ID" ] && [ "$KERNEL_RUN_ID" != "null" ]; then
+            echo ">>> 命中内核 Run ID: $KERNEL_RUN_ID"
+            gh run download "$KERNEL_RUN_ID" --repo OpenMoTa3/kernel-fairphone-sm7225 --dir . || true
           else
-            echo ">>> 未找到内核 Run ID，尝试从 Releases 下载..."
+            echo "Warning: 未找到内核构建 Artifact，尝试从 Release 获取..."
             gh release download --repo OpenMoTa3/kernel-fairphone-sm7225 --pattern "*.deb" --dir . 2>/dev/null || true
           fi
           cd ../../..
 
-      - name: Build Adaptation Debs
+      - name: Fetch Adaptation Debs from Droidian Repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git clone --depth 1 https://gitlab.com/ubports/porting/reference-device-ports/android11/fairphone-4/fairphone-fp4.git /tmp/fp4-ut
-          
-          mkdir -p /tmp/adapt/DEBIAN /tmp/adapt/etc/udev/rules.d
-          if [ -d "/tmp/fp4-ut/overlay/system/etc/udev/rules.d" ]; then
-            cp -r /tmp/fp4-ut/overlay/system/etc/udev/rules.d/* /tmp/adapt/etc/udev/rules.d/
+          cd site/pool/main
+          echo "=== 2. 正在拉取 Droidian 仓库生成的适配包 ==="
+          DROIDIAN_RUN_ID=$(gh run list --repo OpenMoTa3/droidian --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$DROIDIAN_RUN_ID" ] && [ "$DROIDIAN_RUN_ID" != "null" ]; then
+            echo ">>> 命中 Droidian Run ID: $DROIDIAN_RUN_ID"
+            gh run download "$DROIDIAN_RUN_ID" --repo OpenMoTa3/droidian --name droidian-fp4-adaptation-debs --dir . || true
           fi
-          printf "Package: adaptation-fairphone-fp4\nVersion: 1.0.0\nSection: misc\nPriority: optional\nArchitecture: arm64\nMaintainer: OpenMoTa3 <noreply@github.com>\nDepends: udev, adaptation-fairphone-fp4-configs\nDescription: Device adaptation for FP4 on Droidian\n" > /tmp/adapt/DEBIAN/control
-          dpkg-deb --build --root-owner-group /tmp/adapt site/pool/main/adaptation-fairphone-fp4_1.0.0_arm64.deb
+          cd ../../..
 
-          mkdir -p /tmp/adapt-cfg/DEBIAN
-          printf "Package: adaptation-fairphone-fp4-configs\nVersion: 1.0.0\nSection: misc\nPriority: optional\nArchitecture: arm64\nMaintainer: OpenMoTa3 <noreply@github.com>\nDescription: Device adaptation configs for FP4\n" > /tmp/adapt-cfg/DEBIAN/control
-          dpkg-deb --build --root-owner-group /tmp/adapt-cfg site/pool/main/adaptation-fairphone-fp4-configs_1.0.0_arm64.deb
-
-      - name: Generate APT Indexes & Hashes
+      - name: Generate APT Indexes & Release
         run: |
           cd site
+          echo "=== 3. 当前 pool/main/ 中的全部 Deb 清单 ==="
+          ls -lh pool/main/
+
+          # 检查是否有 deb 文件，没有则报警
+          DEB_COUNT=$(ls -1 pool/main/*.deb 2>/dev/null | wc -l)
+          if [ "$DEB_COUNT" -eq 0 ]; then
+            echo "Error: pool/main/ 下没有任何 .deb 包，请先确保内核与适配包构建成功！"
+            exit 1
+          fi
+
+          echo ">>> 正在生成 Packages 和 Packages.gz 索引..."
           dpkg-scanpackages --arch arm64 pool/main > dists/bookworm/main/binary-arm64/Packages
           gzip -9c dists/bookworm/main/binary-arm64/Packages > dists/bookworm/main/binary-arm64/Packages.gz
 
+          echo ">>> 正在生成 Release 元数据..."
           cd dists/bookworm
           printf "APT::FTPArchive::Release::Origin \"OpenMoTa3\";\nAPT::FTPArchive::Release::Label \"Droidian-FP4-Repo\";\nAPT::FTPArchive::Release::Suite \"bookworm\";\nAPT::FTPArchive::Release::Codename \"bookworm\";\nAPT::FTPArchive::Release::Architectures \"arm64\";\nAPT::FTPArchive::Release::Components \"main\";\nAPT::FTPArchive::Release::Description \"APT Repository for Fairphone 4 Droidian\";\n" > apt-release.conf
           apt-ftparchive -c apt-release.conf release . > Release
           rm -f apt-release.conf
           cd ../..
 
-          echo "=== 部署站点全部文件清单 ==="
-          find . -type f
+          echo "=== 4. 最终生成的 Packages 索引内容预览 ==="
+          head -n 30 dists/bookworm/main/binary-arm64/Packages
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
