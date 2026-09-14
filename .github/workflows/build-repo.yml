@@ -33,71 +33,59 @@ jobs:
 
       - name: Prepare APT Directory Structure
         run: |
-          mkdir -p site/pool/main
-          mkdir -p site/dists/bookworm/main/binary-arm64
+          mkdir -p public/packages
+          mkdir -p public/dists/stable/main/binary-arm64
 
       - name: Fetch Kernel Debs from Kernel Repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd site/pool/main
-          echo "=== 1. 正在拉取内核 Deb 包（无视工作流最终状态） ==="
+          cd public/packages
+          echo "=== 1. 拉取内核 Deb 包 ==="
           KERNEL_RUN_ID=$(gh run list --repo OpenMoTa3/kernel-fairphone-sm7225 --workflow "build-droidian-kernel.yml" --limit 1 --json databaseId -q '.[0].databaseId' || true)
           if [ -n "$KERNEL_RUN_ID" ] && [ "$KERNEL_RUN_ID" != "null" ]; then
-            echo ">>> 命中内核 Run ID: $KERNEL_RUN_ID，正在尝试下载产物..."
-            gh run download "$KERNEL_RUN_ID" --repo OpenMoTa3/kernel-fairphone-sm7225 --name droidian-fp4-kernel-deb --dir . || gh run download "$KERNEL_RUN_ID" --repo OpenMoTa3/kernel-fairphone-sm7225 --dir . || true
+            gh run download "$KERNEL_RUN_ID" --repo OpenMoTa3/kernel-fairphone-sm7225 --dir . || true
           fi
-          
-          # 如果 Action 产物拉取未命中，尝试兜底从 Releases 拉取
-          if [ -z "$(ls -A . 2>/dev/null)" ]; then
-            echo "Warning: 未在 Actions 找到产物，尝试从 Releases 下载..."
-            gh release download --repo OpenMoTa3/kernel-fairphone-sm7225 --pattern "*.deb" --dir . 2>/dev/null || true
-          fi
-          cd ../../..
+          cd ../..
 
       - name: Fetch Adaptation Debs from Droidian Repo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd site/pool/main
-          echo "=== 2. 正在拉取 Droidian 仓库生成的适配包（无视后续任务状态） ==="
+          cd public/packages
+          echo "=== 2. 拉取 Droidian 适配 Deb 包 ==="
           DROIDIAN_RUN_ID=$(gh run list --repo OpenMoTa3/droidian --limit 1 --json databaseId -q '.[0].databaseId' || true)
           if [ -n "$DROIDIAN_RUN_ID" ] && [ "$DROIDIAN_RUN_ID" != "null" ]; then
-            echo ">>> 命中 Droidian Run ID: $DROIDIAN_RUN_ID，正在下载适配包..."
             gh run download "$DROIDIAN_RUN_ID" --repo OpenMoTa3/droidian --name droidian-fp4-adaptation-debs --dir . || true
           fi
-          cd ../../..
-
-      - name: Generate APT Indexes & Release
-        run: |
-          cd site
-          echo "=== 3. 当前 pool/main/ 中的全部 Deb 清单 ==="
-          ls -lh pool/main/
-
-          DEB_COUNT=$(ls -1 pool/main/*.deb 2>/dev/null | wc -l)
-          if [ "$DEB_COUNT" -eq 0 ]; then
-            echo "Error: pool/main/ 下没有任何 .deb 包，请检查前置仓库是否已至少运行过一次！"
-            exit 1
-          fi
-
-          echo ">>> 正在生成 Packages 和 Packages.gz 索引..."
-          dpkg-scanpackages --arch arm64 pool/main > dists/bookworm/main/binary-arm64/Packages
-          gzip -9c dists/bookworm/main/binary-arm64/Packages > dists/bookworm/main/binary-arm64/Packages.gz
-
-          echo ">>> 正在生成 Release 元数据与哈希..."
-          cd dists/bookworm
-          printf "APT::FTPArchive::Release::Origin \"OpenMoTa3\";\nAPT::FTPArchive::Release::Label \"Droidian-FP4-Repo\";\nAPT::FTPArchive::Release::Suite \"bookworm\";\nAPT::FTPArchive::Release::Codename \"bookworm\";\nAPT::FTPArchive::Release::Architectures \"arm64\";\nAPT::FTPArchive::Release::Components \"main\";\nAPT::FTPArchive::Release::Description \"APT Repository for Fairphone 4 Droidian\";\n" > apt-release.conf
-          apt-ftparchive -c apt-release.conf release . > Release
-          rm -f apt-release.conf
           cd ../..
 
-          echo "=== 4. 最终生成的 Packages 索引内容预览 ==="
-          head -n 40 dists/bookworm/main/binary-arm64/Packages
+      - name: Generate Official APT Indexes
+        run: |
+          cd public/packages
+          # 扁平化
+          find . -mindepth 2 -type f -name "*.deb" -exec mv -v {} . \;
+          find . -mindepth 1 -type d -empty -delete
+          cd ../..
+
+          echo "=== 当前 packages/ 下的全部实体 Deb ==="
+          ls -lh public/packages/
+
+          echo ">>> 正在按官方规范生成 Packages 索引..."
+          cd public
+          dpkg-scanpackages --arch arm64 packages > dists/stable/main/binary-arm64/Packages
+          gzip -k -f dists/stable/main/binary-arm64/Packages
+
+          echo ">>> 正在按官方规范生成 Release 元数据..."
+          cd dists/stable
+          printf "Origin: https://openmota3.github.io/droidian-repo\nLabel: Droidian PKG\nSuite: stable\nCodename: stable\nVersion: 1.0\nArchitectures: arm64\nComponents: main\nDescription: Fairphone 4 Droidian Packages\n" > Release
+          apt-ftparchive release . >> Release
+          cd ../../..
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site/
+          path: public/
 
       - name: Deploy to GitHub Pages
         id: deployment
